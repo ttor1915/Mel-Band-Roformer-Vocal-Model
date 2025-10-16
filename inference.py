@@ -20,7 +20,7 @@ warnings.filterwarnings("ignore")
 def run_folder(model, args, config, device, verbose=False):
     start_time = time.time()
     model.eval()
-    all_mixtures_path = glob.glob(args.input_folder + '/*.wav')
+    all_mixtures_path = glob.glob(args.input_folder + '/*.flac')
     total_tracks = len(all_mixtures_path)
     print('Total tracks found: {}'.format(total_tracks))
 
