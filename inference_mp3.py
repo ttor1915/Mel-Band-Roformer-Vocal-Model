@@ -16,43 +16,40 @@ from utils import demix_track, get_model_from_config
 import warnings
 warnings.filterwarnings("ignore")
 
-import subprocess
+from pydub import AudioSegment
 
 def _write_mp3_from_float(v, sr, out_path, cbr_bitrate="192k"):
     """
+    pydubを使用してfloat型のnumpy配列をMP3に変換して書き出す
     v: np.ndarray, shape=(T,) or (T,2), float32/-1..1
     sr: int
     out_path: str
     """
-    # shapeを (T, C) に統一
-    if v.ndim == 1:
-        v = v[:, None]
-    # クリップして int16 へ
-    pcm_i16 = np.clip(v, -1.0, 1.0)
-    pcm_i16 = (pcm_i16 * 32767.0).astype("<i2")  # little-endian int16
-    # インタリーブ（FFmpegはインタリーブ想定）
-    interleaved = pcm_i16.reshape(-1, pcm_i16.shape[1]).astype("<i2").tobytes()
+    # NumPy配列をint16形式に変換 (-1.0～1.0 の範囲を -32767～32767 にスケール)
+    int_samples = (v * 32767.0).astype(np.int16)
 
-    ch = v.shape[1]
-    cmd = [
-        "ffmpeg", "-hide_banner", "-loglevel", "error",
-        "-f", "s16le", "-ac", str(ch), "-ar", str(sr), "-i", "pipe:0",
-        "-vn", "-map_metadata", "-1",
-        "-ac", "1",               #  ← モノラル変換
-        "-ar", "16000",           #  ← サンプリングレート16kHz
-        "-c:a", "libmp3lame",
-        "-b:a", cbr_bitrate,            # CBR：高速安定
-        "-compression_level", "0",      # LAMEの高速パス
-        "-write_xing", "0",             # 追記メタ回避で僅かに高速
-        "-threads", "1",
-        out_path
-    ]
-    proc = subprocess.Popen(cmd, stdin=subprocess.PIPE)
-    proc.stdin.write(interleaved)
-    proc.stdin.close()
-    ret = proc.wait()
-    if ret != 0:
-        raise RuntimeError(f"ffmpeg failed with code {ret} for {out_path}")
+    # チャンネル数を取得
+    channels = v.shape[1] if v.ndim > 1 else 1
+
+    # pydubのAudioSegmentオブジェクトを作成
+    audio_segment = AudioSegment(
+        int_samples.tobytes(),
+        frame_rate=sr,
+        sample_width=int_samples.dtype.itemsize,
+        channels=channels
+    )
+
+    # 元のコードの仕様に合わせてモノラル変換とサンプリングレート変更を行う
+    audio_segment = audio_segment.set_channels(1)       # モノラルに変換
+    audio_segment = audio_segment.set_frame_rate(16000)   # サンプリングレートを16kHzに変換
+
+    # MP3ファイルとして書き出し
+    audio_segment.export(
+        out_path,
+        format="mp3",
+        bitrate=cbr_bitrate,
+        parameters=["-compression_level", "0"] # LAMEの高速パス（オプション）
+    )
 
 
 
