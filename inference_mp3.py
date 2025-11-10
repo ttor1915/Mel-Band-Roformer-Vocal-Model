@@ -3,7 +3,6 @@ import yaml
 import numpy as np
 import time
 from ml_collections import ConfigDict
-from omegaconf import OmegaConf
 from tqdm import tqdm
 import sys
 import os
@@ -12,60 +11,46 @@ import torch
 import soundfile as sf
 import torch.nn as nn
 from utils import demix_track, get_model_from_config
-
+from pydub import AudioSegment
+import io
 import warnings
 warnings.filterwarnings("ignore")
 
-from pydub import AudioSegment
 
-def _write_mp3_from_float(v, sr, out_path, cbr_bitrate="192k"):
-    """
-    pydubを使用してfloat型のnumpy配列をMP3に変換して書き出す
-    v: np.ndarray, shape=(T,) or (T,2), float32/-1..1
-    sr: int
-    out_path: str
-    """
-    # NumPy配列をint16形式に変換 (-1.0～1.0 の範囲を -32767～32767 にスケール)
-    int_samples = (v * 32767.0).astype(np.int16)
+def write_mp3_from_array(audio_array, sample_rate, output_path):
+    """NumPy配列を16 kHzモノラルMP3で保存"""
+    target_sr = 16000
+    # ステレオ → モノラル
+    if audio_array.ndim > 1:
+        audio_array = np.mean(audio_array, axis=1)
+    # 正規化（-1〜1）
+    audio_array = np.clip(audio_array, -1, 1)
+    # float → 16bit PCM
+    audio_int16 = np.int16(audio_array * 32767)
 
-    # チャンネル数を取得
-    channels = v.shape[1] if v.ndim > 1 else 1
+    # 一時的にWAV化してpydubへ
+    buffer = io.BytesIO()
+    sf.write(buffer, audio_int16, sample_rate, subtype="PCM_16", format="WAV")
+    buffer.seek(0)
+    segment = AudioSegment.from_wav(buffer)
 
-    # pydubのAudioSegmentオブジェクトを作成
-    audio_segment = AudioSegment(
-        int_samples.tobytes(),
-        frame_rate=sr,
-        sample_width=int_samples.dtype.itemsize,
-        channels=channels
-    )
-
-    # 元のコードの仕様に合わせてモノラル変換とサンプリングレート変更を行う
-    audio_segment = audio_segment.set_channels(1)       # モノラルに変換
-    audio_segment = audio_segment.set_frame_rate(16000)   # サンプリングレートを16kHzに変換
-
-    # MP3ファイルとして書き出し
-    audio_segment.export(
-        out_path,
-        format="mp3",
-        bitrate=cbr_bitrate,
-        parameters=["-compression_level", "0"] # LAMEの高速パス（オプション）
-    )
-
+    # 16 kHzモノラルへ変換
+    segment = segment.set_frame_rate(target_sr).set_channels(1)
+    segment.export(output_path, format="mp3", bitrate="128k")
 
 
 def run_folder(model, args, config, device, verbose=False):
     start_time = time.time()
     model.eval()
-    all_mixtures_path = glob.glob(args.input_folder + '/*.mp3')
+    all_mixtures_path = glob.glob(args.input_folder + "/*.flac")
     total_tracks = len(all_mixtures_path)
-    print('Total tracks found: {}'.format(total_tracks))
+    print(f"Total tracks found: {total_tracks}")
 
     instruments = config.training.instruments
     if config.training.target_instrument is not None:
         instruments = [config.training.target_instrument]
 
-    if not os.path.isdir(args.store_dir):
-        os.mkdir(args.store_dir)
+    os.makedirs(args.store_dir, exist_ok=True)
 
     if not verbose:
         all_mixtures_path = tqdm(all_mixtures_path)
@@ -83,38 +68,32 @@ def run_folder(model, args, config, device, verbose=False):
 
         mixture = torch.tensor(mix.T, dtype=torch.float32)
 
-        if first_chunk_time is not None:
-            total_length = mixture.shape[1]
-            num_chunks = (total_length + config.inference.chunk_size // config.inference.num_overlap - 1) // (config.inference.chunk_size // config.inference.num_overlap)
-            estimated_total_time = first_chunk_time * num_chunks
-            print(f"Estimated total processing time for this track: {estimated_total_time:.2f} seconds")
-            sys.stdout.write(f"Estimated time remaining: {estimated_total_time:.2f} seconds\r")
-            sys.stdout.flush()
-
         res, first_chunk_time = demix_track(config, model, mixture, device, first_chunk_time)
 
-        for instr in instruments:
-            vocals_output = res[instr].T  # (T, C)
-            if original_mono:
-                vocals_output = vocals_output[:, 0]  # (T,)
+        # ボーカル
+        vocals_output = res[instruments[0]].T
+        if original_mono:
+            vocals_output = vocals_output[:, 0]
+        mp3_path = f"{args.store_dir}/{os.path.basename(path)[:-5]}_{instruments[0]}.mp3"
+        write_mp3_from_array(vocals_output, sr, mp3_path)
 
-            mp3_path = "{}/{}_{}.mp3".format(
-                args.store_dir, os.path.basename(path)[:-4], instr  # ".mp3"→4文字
-            )
-            _write_mp3_from_float(vocals_output, sr, mp3_path, cbr_bitrate="192k")
+        # インスト
+        # original_mix, _ = sf.read(path)
+        # instrumental = original_mix - vocals_output
+        # instrumental_path = f"{args.store_dir}/{os.path.basename(path)[:-5]}_instrumental.mp3"
+        # write_mp3_from_array(instrumental, sr, instrumental_path)
 
-    time.sleep(1)
-    print("Elapsed time: {:.2f} sec".format(time.time() - start_time))
+    print(f"Elapsed time: {time.time() - start_time:.2f} sec")
 
 
 def proc_folder(args):
     parser = argparse.ArgumentParser()
-    parser.add_argument("--model_type", type=str, default='mel_band_roformer')
+    parser.add_argument("--model_type", type=str, default="mel_band_roformer")
     parser.add_argument("--config_path", type=str, help="path to config yaml file")
-    parser.add_argument("--model_path", type=str, default='', help="Location of the model")
+    parser.add_argument("--model_path", type=str, default="", help="Location of the model")
     parser.add_argument("--input_folder", type=str, help="folder with songs to process")
     parser.add_argument("--store_dir", default="", type=str, help="path to store model outputs")
-    parser.add_argument("--device_ids", nargs='+', type=int, default=0, help='list of gpu ids')
+    parser.add_argument("--device_ids", nargs="+", type=int, default=0, help="list of gpu ids")
     if args is None:
         args = parser.parse_args()
     else:
@@ -123,26 +102,24 @@ def proc_folder(args):
     torch.backends.cudnn.benchmark = True
 
     with open(args.config_path) as f:
-      config = ConfigDict(yaml.load(f, Loader=yaml.FullLoader))
+        config = ConfigDict(yaml.load(f, Loader=yaml.FullLoader))
 
     model = get_model_from_config(args.model_type, config)
-    if args.model_path != '':
-        print('Using model: {}'.format(args.model_path))
-        model.load_state_dict(
-            torch.load(args.model_path, map_location=torch.device('cpu'))
-        )
+    if args.model_path != "":
+        print(f"Using model: {args.model_path}")
+        model.load_state_dict(torch.load(args.model_path, map_location=torch.device("cpu")))
 
     if torch.cuda.is_available():
         device_ids = args.device_ids
-        if type(device_ids)==int:
-            device = torch.device(f'cuda:{device_ids}')
+        if isinstance(device_ids, int):
+            device = torch.device(f"cuda:{device_ids}")
             model = model.to(device)
         else:
-            device = torch.device(f'cuda:{device_ids[0]}')
+            device = torch.device(f"cuda:{device_ids[0]}")
             model = nn.DataParallel(model, device_ids=device_ids).to(device)
     else:
-        device = 'cpu'
-        print('CUDA is not available. Run inference on CPU. It will be very slow...')
+        device = "cpu"
+        print("CUDA is not available. Run inference on CPU. It will be very slow...")
         model = model.to(device)
 
     run_folder(model, args, config, device, verbose=False)
