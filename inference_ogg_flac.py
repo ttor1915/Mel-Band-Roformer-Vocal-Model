@@ -21,13 +21,8 @@ from utils import demix_track, get_model_from_config
 import warnings
 warnings.filterwarnings("ignore")
 
-# --- torchaudio 前提 ---
-try:
-    import torchaudio
-except Exception as e:
-    raise ImportError(
-        "torchaudio が見つかりません。`pip install torchaudio` を実行してください。"
-    ) from e
+import torchaudio
+
 
 
 # ===== ユーティリティ =====
@@ -43,7 +38,7 @@ def _get_resampler(orig_sr: int, target_sr: int, device_str: str):
 
 def _load_mono_resampled(path: str, target_sr: int, device: torch.device) -> np.ndarray:
     """
-    mp3 を torchaudio で読込み、モノラル化し、target_sr にリサンプルして np.float32(1D) を返す。
+    ogg を torchaudio で読込み、モノラル化し、target_sr にリサンプルして np.float32(1D) を返す。
     """
     # ロード（CPUテンソル [C, T], float32）
     wav_t, sr = torchaudio.load(path)
@@ -92,8 +87,8 @@ def run_folder(model, args, config, device, verbose=False):
     start_time = time.time()
     model.eval()
 
-    # 入力は mp3（モノラル想定）
-    all_mixtures_path = sorted(glob.glob(os.path.join(args.input_folder, "*.mp3")))
+    # 入力は ogg（モノラル想定）
+    all_mixtures_path = sorted(glob.glob(os.path.join(args.input_folder, "*.ogg")))
     total_tracks = len(all_mixtures_path)
     print(f"Total tracks found: {total_tracks}")
 
@@ -146,7 +141,7 @@ def proc_folder(cli_args):
     parser.add_argument("--model_type", type=str, default="mel_band_roformer")
     parser.add_argument("--config_path", type=str, required=True, help="path to config yaml file")
     parser.add_argument("--model_path", type=str, default="", help="Location of the model .pt/.pth")
-    parser.add_argument("--input_folder", type=str, required=True, help="folder with mono mp3 files")
+    parser.add_argument("--input_folder", type=str, required=True, help="folder with mono ogg files")
     parser.add_argument("--store_dir", type=str, required=True, help="output directory")
     parser.add_argument("--device_ids", nargs="+", type=int, default=0, help="GPU id(s) or single int")
     args = parser.parse_args(cli_args) if cli_args is not None else parser.parse_args()
