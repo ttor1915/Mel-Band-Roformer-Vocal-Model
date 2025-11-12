@@ -1,6 +1,5 @@
 import argparse
 import yaml
-import numpy as np
 import time
 from ml_collections import ConfigDict
 from omegaconf import OmegaConf
@@ -16,11 +15,16 @@ from utils import demix_track, get_model_from_config
 import warnings
 warnings.filterwarnings("ignore")
 
+import numpy as np
+
+import io
+import subprocess
 
 def run_folder(model, args, config, device, verbose=False):
     start_time = time.time()
     model.eval()
-    all_mixtures_path = glob.glob(args.input_folder + '/*.flac')
+    # all_mixtures_path = glob.glob(args.input_folder + '/*.wav')
+    all_mixtures_path = glob.glob(args.input_folder + '/*')  # WAV以外の拡張子も対象にする
     total_tracks = len(all_mixtures_path)
     print('Total tracks found: {}'.format(total_tracks))
 
@@ -39,13 +43,20 @@ def run_folder(model, args, config, device, verbose=False):
     for track_number, path in enumerate(all_mixtures_path, 1):
         print(f"\nProcessing track {track_number}/{total_tracks}: {os.path.basename(path)}")
 
-        mix, sr = sf.read(path)
-        original_mono = False
-        if len(mix.shape) == 1:
-            original_mono = True
-            mix = np.stack([mix, mix], axis=-1)
+        # mix, sr = sf.read(path)
+        try:
+            mix, sr = sf.read(path)
+        except RuntimeError as e:
+            print(f"Error reading file {path}: {e}")
+            continue  # エラーが発生した場合は次のファイルへ
 
+        # モノラルならステレオに変換（2チャンネル化）
+        if len(mix.shape) == 1:
+            mix = np.stack([mix, mix], axis=1)
+            
         mixture = torch.tensor(mix.T, dtype=torch.float32)
+
+        filename, ext = os.path.splitext(os.path.basename(path))
 
         if first_chunk_time is not None:
             total_length = mixture.shape[1]
@@ -57,33 +68,57 @@ def run_folder(model, args, config, device, verbose=False):
 
         res, first_chunk_time = demix_track(config, model, mixture, device, first_chunk_time)
 
+        # for instr in instruments:
+        #     vocals_path = "{}/{}.wav".format(args.store_dir, filename)
+        #     sf.write(vocals_path, res[instr].T, sr, subtype='FLOAT')
+
+
+
         for instr in instruments:
-            vocals_output = res[instr].T
-            if original_mono:
-                vocals_output = vocals_output[:, 0]
+            wav_buffer = io.BytesIO()
+            sf.write(wav_buffer, res[instr].T, sr, format='WAV', subtype='FLOAT')
+            wav_buffer.seek(0)
 
-            vocals_path = "{}/{}_{}.wav".format(args.store_dir, os.path.basename(path)[:-4], instr)
-            sf.write(vocals_path, vocals_output, sr, subtype='FLOAT')
+            vocals_path = "{}/{}.ogg".format(args.store_dir, filename)
 
-        vocals_output = res[instruments[0]].T
-        if original_mono:
-            vocals_output = vocals_output[:, 0]
 
-        original_mix, _ = sf.read(path)
-        instrumental = original_mix - vocals_output
+            cmd =  [
+                    'ffmpeg',
+                    '-y',                    # 出力を上書き
+                    '-f', 'wav',             # 入力フォーマット
+                    '-i', 'pipe:0',          # 標準入力から読み取る
+                    '-acodec', 'libopus',  # 出力コーデック
+                    "-ar", "16000",
+                    "-ac", "1",
+                    "-b:a", "64k",
+                    vocals_path             # 出力ファイル
+                ]
+            # cmd = [
+            #         'C:/Users/user/anaconda3/envs/MusicSourceSeparation/Library/bin/ffmpeg.exe',
+            #         '-y',                    # 出力を上書き
+            #         '-f', 'wav', '-i', 'pipe:0',
+            #         '-c:a', 'opus',           # 内蔵opus
+            #         '-b:a', '128k',           # 例: ターゲットビットレート
+            #         '-compression_level', '10',
+            #         '-strict', '-2',          # ← experimental を許可
+            #         vocals_path             # 出力ファイル
+            #     ]
+            subprocess.run(cmd, check=False, capture_output=True, text=True)
 
-        instrumental_path = "{}/{}_instrumental.wav".format(args.store_dir, os.path.basename(path)[:-4])
-        sf.write(instrumental_path, instrumental, sr, subtype='FLOAT')
 
-    time.sleep(1)
+
+    # time.sleep(1)
     print("Elapsed time: {:.2f} sec".format(time.time() - start_time))
 
 
 def proc_folder(args):
+    config_path_defult = '/home/user1/Mel-Band-Roformer-Vocal-Model-main/configs/config_vocals_mel_band_roformer_keytube.yaml'
+    start_check_point_defult = '/home/user1/Mel-Band-Roformer-Vocal-Model-main/models/MelBandRoformer.ckpt'
+
     parser = argparse.ArgumentParser()
     parser.add_argument("--model_type", type=str, default='mel_band_roformer')
-    parser.add_argument("--config_path", type=str, help="path to config yaml file")
-    parser.add_argument("--model_path", type=str, default='', help="Location of the model")
+    parser.add_argument("--config_path", type=str, default=config_path_defult,help="path to config yaml file")
+    parser.add_argument("--model_path", type=str, default=start_check_point_defult, help="Location of the model")
     parser.add_argument("--input_folder", type=str, help="folder with songs to process")
     parser.add_argument("--store_dir", default="", type=str, help="path to store model outputs")
     parser.add_argument("--device_ids", nargs='+', type=int, default=0, help='list of gpu ids')
