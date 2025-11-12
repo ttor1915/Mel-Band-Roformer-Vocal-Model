@@ -68,21 +68,16 @@ def run_folder(model, args, config, device, verbose=False):
 
         res, first_chunk_time = demix_track(config, model, mixture, device, first_chunk_time)
 
-        # for instr in instruments:
-        #     vocals_path = "{}/{}.wav".format(args.store_dir, filename)
-        #     sf.write(vocals_path, res[instr].T, sr, subtype='FLOAT')
-
-
 
         for instr in instruments:
             wav_buffer = io.BytesIO()
             sf.write(wav_buffer, res[instr].T, sr, format='WAV', subtype='FLOAT')
             wav_buffer.seek(0)
 
-            vocals_path = "{}/{}.ogg".format(args.store_dir, filename)
+            vocals_path = "{}/{}.ogg".format(args.store_dir, filename, instr)
 
-
-            cmd =  [
+            process = subprocess.Popen(
+                [
                     'ffmpeg',
                     '-y',                    # 出力を上書き
                     '-f', 'wav',             # 入力フォーマット
@@ -92,19 +87,29 @@ def run_folder(model, args, config, device, verbose=False):
                     "-ac", "1",
                     "-b:a", "64k",
                     vocals_path             # 出力ファイル
-                ]
-            # cmd = [
-            #         'C:/Users/user/anaconda3/envs/MusicSourceSeparation/Library/bin/ffmpeg.exe',
-            #         '-y',                    # 出力を上書き
-            #         '-f', 'wav', '-i', 'pipe:0',
-            #         '-c:a', 'opus',           # 内蔵opus
-            #         '-b:a', '128k',           # 例: ターゲットビットレート
-            #         '-compression_level', '10',
-            #         '-strict', '-2',          # ← experimental を許可
-            #         vocals_path             # 出力ファイル
-            #     ]
-            subprocess.run(cmd, check=False, capture_output=True, text=True)
+                ],
+                # [
+                #     'C:/Users/user/anaconda3/envs/MusicSourceSeparation/Library/bin/ffmpeg.exe',
+                #     '-y',                    # 出力を上書き
+                #     '-f', 'wav', '-i', 'pipe:0',
+                #     '-c:a', 'opus',           # 内蔵opus
+                #     '-b:a', '128k',           # 例: ターゲットビットレート
+                #     '-compression_level', '10',
+                #     '-strict', '-2',          # ← experimental を許可
+                #     vocals_path             # 出力ファイル
+                # ],
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE
+            )
 
+            stdout, stderr = process.communicate(input=wav_buffer.read())
+
+            # 結果確認
+            if process.returncode == 0:
+                print("変換成功: output.ogg が作成されました")
+            else:
+                print("変換エラー:", stderr.decode('utf-8'))
 
 
     # time.sleep(1)
