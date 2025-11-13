@@ -17,7 +17,7 @@ warnings.filterwarnings("ignore")
 
 import numpy as np
 
-
+import librosa
 
 def run_folder(model, args, config, device, verbose=False):
     # start_time = time.time()
@@ -62,8 +62,19 @@ def run_folder(model, args, config, device, verbose=False):
         res, first_chunk_time = demix_track(config, model, mixture, device, first_chunk_time)
 
         for instr in instruments:
-            vocals_path = "{}/{}.wav".format(args.store_dir, filename)
-            sf.write(vocals_path, res[instr].T, sr, subtype='FLOAT')
+            # vocals_path = "{}/{}.wav".format(args.store_dir, filename)
+            # sf.write(vocals_path, res[instr].T, sr, subtype='FLOAT')
+
+            # 元の波形（res[instr]）をモノラル化
+            mono = librosa.to_mono(res[instr])
+
+            # 16 kHz にリサンプリング
+            mono_16k = librosa.resample(mono, orig_sr=sr, target_sr=16000)
+
+            vocals_path = f"{args.store_dir}/{filename}.wav"
+
+            # 16k・モノラルで保存
+            sf.write(vocals_path, mono_16k, 16000, subtype='FLOAT')
 
 
     # time.sleep(1)
