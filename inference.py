@@ -46,8 +46,7 @@ def run_folder(model, args, config, device, verbose=False):
             # 出力ファイルを楽器ごとに開く（16k, モノラル）
             writers = {}
             for instr in instruments:
-                # 必要に応じて f"{filename}.wav" に戻してもよい
-                out_path = f"{args.store_dir}/{filename}_{instr}.wav"
+                out_path = f"{args.store_dir}/{filename}.wav"
                 writers[instr] = sf.SoundFile(
                     out_path,
                     mode="w",
@@ -84,7 +83,8 @@ def run_folder(model, args, config, device, verbose=False):
 
                     # chunk_stereo: (channels, samples) を想定
                     # モノラル化（librosa.to_mono でもよいが平均を直接取る方が軽い）
-                    mono = chunk_stereo.mean(axis=0).astype(np.float32)  # (samples,)
+                    # mono = chunk_stereo.mean(axis=0).astype(np.float32)  # (samples,)
+                    mono = chunk_stereo[0].astype(np.float32)
 
                     # 16kHz にリサンプリング
                     mono_16k = librosa.resample(
