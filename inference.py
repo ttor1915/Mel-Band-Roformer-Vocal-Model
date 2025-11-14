@@ -19,12 +19,14 @@ import numpy as np
 
 import librosa
 
+
 def run_folder(model, args, config, device, verbose=False):
-    # start_time = time.time()
+    # 長すぎる音声を避けるための最大チャンク長（秒）
+    # 必要に応じて 60.0 を 30.0 や 120.0 に変更してください
+    MAX_SEGMENT_SEC = 1200.0
+
     model.eval()
     all_mixtures_path = glob.glob(args.input_folder + '/*.ogg')
-    # total_tracks = len(all_mixtures_path)
-    # print('Total tracks found: {}'.format(total_tracks))
 
     instruments = config.training.instruments
     if config.training.target_instrument is not None:
@@ -36,35 +38,53 @@ def run_folder(model, args, config, device, verbose=False):
     if not verbose:
         all_mixtures_path = tqdm(all_mixtures_path)
 
+    # チャンク処理時間を demix_track に渡すための変数
     first_chunk_time = None
 
     for track_number, path in enumerate(all_mixtures_path, 1):
-        # print(f"\nProcessing track {track_number}/{total_tracks}: {os.path.basename(path)}")
-
-        mix, sr = sf.read(path)
-
-        # モノラルならステレオに変換（2チャンネル化）
-        if len(mix.shape) == 1:
-            mix = np.stack([mix, mix], axis=1)
-            
-        mixture = torch.tensor(mix.T, dtype=torch.float32)
-
         filename, ext = os.path.splitext(os.path.basename(path))
 
-        # if first_chunk_time is not None:
-        #     total_length = mixture.shape[1]
-        #     num_chunks = (total_length + config.inference.chunk_size // config.inference.num_overlap - 1) // (config.inference.chunk_size // config.inference.num_overlap)
-        #     estimated_total_time = first_chunk_time * num_chunks
-        #     print(f"Estimated total processing time for this track: {estimated_total_time:.2f} seconds")
-        #     sys.stdout.write(f"Estimated time remaining: {estimated_total_time:.2f} seconds\r")
-        #     sys.stdout.flush()
+        # 音声を一括で読み込まず、SoundFile でチャンク単位に読み込む
+        with sf.SoundFile(path) as f:
+            sr = f.samplerate
+            total_frames = len(f)
+            segment_frames = int(MAX_SEGMENT_SEC * sr)
 
-        res, first_chunk_time = demix_track(config, model, mixture, device, first_chunk_time)
+            # 楽器ごとにチャンク結果を溜めるバッファ
+            res_segments = {instr: [] for instr in instruments}
 
+            # ファイル全体を segment_frames ごとに分割して処理
+            for start in range(0, total_frames, segment_frames):
+                f.seek(start)
+                frames = min(segment_frames, total_frames - start)
+
+                # mix: shape = (frames, channels) or (frames,)
+                mix = f.read(frames, dtype='float32')
+
+                # モノラルならステレオに変換（2チャンネル化）
+                if mix.ndim == 1:
+                    mix = np.stack([mix, mix], axis=1)  # (frames, 2)
+
+                # demix_track が期待する形 (channels, samples) に転置
+                mixture = torch.tensor(mix.T, dtype=torch.float32)
+
+                # チャンクごとに分離
+                res_chunk, first_chunk_time = demix_track(
+                    config, model, mixture, device, first_chunk_time
+                )
+
+                # 楽器ごとに結果を蓄積（時間方向に後で結合）
+                for instr in instruments:
+                    res_segments[instr].append(res_chunk[instr])
+
+            # 全チャンクを時間方向（サンプル方向）に連結
+            res = {}
+            for instr in instruments:
+                # res_chunk[instr] は shape = (channels, samples) を想定
+                res[instr] = np.concatenate(res_segments[instr], axis=1)
+
+        # ここからは従来どおり：モノラル化 → 16kHz リサンプリング → 保存
         for instr in instruments:
-            # vocals_path = "{}/{}.wav".format(args.store_dir, filename)
-            # sf.write(vocals_path, res[instr].T, sr, subtype='FLOAT')
-
             # 元の波形（res[instr]）をモノラル化
             mono = librosa.to_mono(res[instr])
 
@@ -76,9 +96,6 @@ def run_folder(model, args, config, device, verbose=False):
             # 16k・モノラルで保存
             sf.write(vocals_path, mono_16k, 16000, subtype='FLOAT')
 
-
-    # time.sleep(1)
-    # print("Elapsed time: {:.2f} sec".format(time.time() - start_time))
 
 
 def proc_folder(args):
@@ -101,28 +118,14 @@ def proc_folder(args):
       config = ConfigDict(yaml.load(f, Loader=yaml.FullLoader))
 
     model = get_model_from_config(args.model_type, config)
-    if args.model_path != '':
-        print('Using model: {}'.format(args.model_path))
-        model.load_state_dict(
-            torch.load(args.model_path, map_location=torch.device('cpu'))
-        )
-
-    # if torch.cuda.is_available():
-    #     device_ids = args.device_ids
-    #     if type(device_ids)==int:
-    #         device = torch.device(f'cuda:{device_ids}')
-    #         model = model.to(device)
-    #     else:
-    #         device = torch.device(f'cuda:{device_ids[0]}')
-    #         model = nn.DataParallel(model, device_ids=device_ids).to(device)
-    # else:
-    #     device = 'cpu'
-    #     print('CUDA is not available. Run inference on CPU. It will be very slow...')
-    #     model = model.to(device)
 
     device_ids = args.device_ids
     device = torch.device(f'cuda:{device_ids}')
     model = model.to(device)
+
+    model.load_state_dict(
+        torch.load(args.model_path, map_location=device)
+    )
 
     run_folder(model, args, config, device, verbose=False)
 
