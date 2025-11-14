@@ -1,28 +1,22 @@
 import argparse
 import yaml
-# import time
 from ml_collections import ConfigDict
-# from omegaconf import OmegaConf
 from tqdm import tqdm
-# import sys
 import os
 import glob
 import torch
 import soundfile as sf
-# import torch.nn as nn
 from utils import demix_track, get_model_from_config
 
 import warnings
 warnings.filterwarnings("ignore")
 
 import numpy as np
-
 import librosa
 
 
 def run_folder(model, args, config, device, verbose=False):
-    # 長すぎる音声を避けるための最大チャンク長（秒）
-    # 必要に応じて 60.0 を 30.0 や 120.0 に変更してください
+    # 1チャンクの長さ（秒）。GPUメモリに合わせて調整。
     MAX_SEGMENT_SEC = 1200.0
 
     model.eval()
@@ -38,63 +32,78 @@ def run_folder(model, args, config, device, verbose=False):
     if not verbose:
         all_mixtures_path = tqdm(all_mixtures_path)
 
-    # チャンク処理時間を demix_track に渡すための変数
     first_chunk_time = None
 
     for track_number, path in enumerate(all_mixtures_path, 1):
         filename, ext = os.path.splitext(os.path.basename(path))
 
-        # 音声を一括で読み込まず、SoundFile でチャンク単位に読み込む
-        with sf.SoundFile(path) as f:
-            sr = f.samplerate
-            total_frames = len(f)
+        # 入力ファイルをストリーミング読み込み
+        with sf.SoundFile(path) as f_in:
+            sr = f_in.samplerate
+            total_frames = len(f_in)
             segment_frames = int(MAX_SEGMENT_SEC * sr)
 
-            # 楽器ごとにチャンク結果を溜めるバッファ
-            res_segments = {instr: [] for instr in instruments}
+            # 出力ファイルを楽器ごとに開く（16k, モノラル）
+            writers = {}
+            for instr in instruments:
+                # 必要に応じて f"{filename}.wav" に戻してもよい
+                out_path = f"{args.store_dir}/{filename}_{instr}.wav"
+                writers[instr] = sf.SoundFile(
+                    out_path,
+                    mode="w",
+                    samplerate=16000,
+                    channels=1,
+                    subtype="FLOAT",
+                )
 
-            # ファイル全体を segment_frames ごとに分割して処理
+            # ファイル全体をチャンクに分けて処理
             for start in range(0, total_frames, segment_frames):
-                f.seek(start)
                 frames = min(segment_frames, total_frames - start)
+                f_in.seek(start)
+                mix = f_in.read(frames, dtype="float32")  # (frames,) or (frames, ch)
 
-                # mix: shape = (frames, channels) or (frames,)
-                mix = f.read(frames, dtype='float32')
-
-                # モノラルならステレオに変換（2チャンネル化）
+                # モノラルならステレオに複製
                 if mix.ndim == 1:
                     mix = np.stack([mix, mix], axis=1)  # (frames, 2)
 
-                # demix_track が期待する形 (channels, samples) に転置
+                # (channels, samples) に転置してテンソル化
                 mixture = torch.tensor(mix.T, dtype=torch.float32)
 
-                # チャンクごとに分離
+                # demix（チャンク単位）
                 res_chunk, first_chunk_time = demix_track(
                     config, model, mixture, device, first_chunk_time
                 )
 
-                # 楽器ごとに結果を蓄積（時間方向に後で結合）
+                # メモリを抑えるため、チャンクごとにモノラル＋16kにして即書き出し
                 for instr in instruments:
-                    res_segments[instr].append(res_chunk[instr])
+                    chunk_stereo = res_chunk[instr]
 
-            # 全チャンクを時間方向（サンプル方向）に連結
-            res = {}
+                    # torch.Tensor の場合は numpy に変換
+                    if isinstance(chunk_stereo, torch.Tensor):
+                        chunk_stereo = chunk_stereo.detach().cpu().numpy()
+
+                    # chunk_stereo: (channels, samples) を想定
+                    # モノラル化（librosa.to_mono でもよいが平均を直接取る方が軽い）
+                    mono = chunk_stereo.mean(axis=0).astype(np.float32)  # (samples,)
+
+                    # 16kHz にリサンプリング
+                    mono_16k = librosa.resample(
+                        mono, orig_sr=sr, target_sr=16000
+                    ).astype(np.float32)
+
+                    # 即ファイルに追記
+                    writers[instr].write(mono_16k)
+
+                    # チャンク内の一時配列を解放しやすくする
+                    del chunk_stereo, mono, mono_16k
+
+                # 入力チャンクも解放
+                del mix, mixture, res_chunk
+
+            # 出力ファイルを閉じる
             for instr in instruments:
-                # res_chunk[instr] は shape = (channels, samples) を想定
-                res[instr] = np.concatenate(res_segments[instr], axis=1)
-
-        # ここからは従来どおり：モノラル化 → 16kHz リサンプリング → 保存
-        for instr in instruments:
-            # 元の波形（res[instr]）をモノラル化
-            mono = librosa.to_mono(res[instr])
-
-            # 16 kHz にリサンプリング
-            mono_16k = librosa.resample(mono, orig_sr=sr, target_sr=16000)
-
-            vocals_path = f"{args.store_dir}/{filename}.wav"
-
-            # 16k・モノラルで保存
-            sf.write(vocals_path, mono_16k, 16000, subtype='FLOAT')
+                writers[instr].close()
+            del writers
 
 
 
