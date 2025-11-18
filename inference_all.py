@@ -17,6 +17,7 @@ from tqdm import tqdm
 from ml_collections import ConfigDict
 
 # 外部ライブラリの依存
+# pip install rotary-embedding-torch einops librosa torchaudio soundfile ml_collections
 from rotary_embedding_torch import RotaryEmbedding
 from einops import rearrange, pack, unpack, reduce, repeat
 from librosa import filters
@@ -29,7 +30,6 @@ warnings.filterwarnings("ignore")
 # 1. Model Definitions (Optimized)
 # ==========================================
 
-# helper functions
 def exists(val):
     return val is not None
 
@@ -42,7 +42,6 @@ def pack_one(t, pattern):
 def unpack_one(t, ps, pattern):
     return unpack(t, ps, pattern)[0]
 
-# Attend Module (PyTorch Flash Attention Wrapper)
 class Attend(nn.Module):
     def __init__(self, dropout=0., flash=True):
         super().__init__()
@@ -50,13 +49,12 @@ class Attend(nn.Module):
         self.flash = flash
 
     def forward(self, q, k, v):
-        # PyTorch 2.0+ scaled_dot_product_attention (Flash Attention)
+        # PyTorch 2.0+ Flash Attention
         return F.scaled_dot_product_attention(
             q, k, v,
             dropout_p=self.dropout if self.training else 0.0
         )
 
-# RMSNorm
 class RMSNorm(nn.Module):
     def __init__(self, dim):
         super().__init__()
@@ -66,7 +64,6 @@ class RMSNorm(nn.Module):
     def forward(self, x):
         return F.normalize(x, dim=-1) * self.scale * self.gamma
 
-# FeedForward
 class FeedForward(nn.Module):
     def __init__(self, dim, mult=4, dropout=0.):
         super().__init__()
@@ -83,7 +80,6 @@ class FeedForward(nn.Module):
     def forward(self, x):
         return self.net(x)
 
-# Attention
 class Attention(nn.Module):
     def __init__(
             self,
@@ -127,7 +123,6 @@ class Attention(nn.Module):
         out = rearrange(out, 'b h n d -> b n (h d)')
         return self.to_out(out)
 
-# Transformer
 class Transformer(nn.Module):
     def __init__(
             self,
@@ -161,7 +156,6 @@ class Transformer(nn.Module):
             x = ff(x) + x
         return self.norm(x)
 
-# BandSplit
 class BandSplit(nn.Module):
     def __init__(self, dim, dim_inputs):
         super().__init__()
@@ -183,7 +177,6 @@ class BandSplit(nn.Module):
             outs.append(split_output)
         return torch.stack(outs, dim=-2)
 
-# MLP Helper
 def MLP(dim_in, dim_out, dim_hidden=None, depth=1, activation=nn.Tanh):
     dim_hidden = default(dim_hidden, dim_in)
     net = []
@@ -197,7 +190,6 @@ def MLP(dim_in, dim_out, dim_hidden=None, depth=1, activation=nn.Tanh):
         net.append(activation())
     return nn.Sequential(*net)
 
-# MaskEstimator
 class MaskEstimator(nn.Module):
     def __init__(self, dim, dim_inputs, depth, mlp_expansion_factor=4):
         super().__init__()
@@ -220,7 +212,6 @@ class MaskEstimator(nn.Module):
             outs.append(freq_out)
         return torch.cat(outs, dim=-1)
 
-# Main Model Class: MelBandRoformer
 class MelBandRoformer(nn.Module):
     def __init__(
             self,
@@ -334,7 +325,6 @@ class MelBandRoformer(nn.Module):
         batch, channels, raw_audio_length = raw_audio.shape
         istft_length = raw_audio_length if self.match_input_audio_length else None
         
-        # to stft
         raw_audio, batch_audio_channel_packed_shape = pack_one(raw_audio, '* t')
         stft_window = self.stft_window_fn(device=device)
 
@@ -387,14 +377,10 @@ class MelBandRoformer(nn.Module):
 
 
 # ==========================================
-# 2. Processing Utils (Batched & Optimized)
+# 2. Processing Utils (Batched)
 # ==========================================
 
-def demix_track(config, model, mix, device, batch_size=4, first_chunk_time=None):
-    """
-    トラックをバッチ処理して高速化する関数。
-    batch_size=4 の場合、理論上4倍近いスループットが出ますがメモリも食います。
-    """
+def demix_track(config, model, mix, device, batch_size=1, first_chunk_time=None):
     C = config.inference.chunk_size
     N = config.inference.num_overlap
     step = C // N
@@ -412,7 +398,6 @@ def demix_track(config, model, mix, device, batch_size=4, first_chunk_time=None)
 
             total_length = mix.shape[1]
             
-            # すべてのチャンクの開始位置をリスト化
             starts = list(range(0, total_length, step))
             num_chunks = len(starts)
             
@@ -423,51 +408,35 @@ def demix_track(config, model, mix, device, batch_size=4, first_chunk_time=None)
 
             chunk_start_time = None
 
-            # バッチループ
             for i in range(0, num_chunks, batch_size):
-                # 現在のバッチに含まれるインデックスを取得
                 current_starts = starts[i : i + batch_size]
                 
-                # バッチ入力テンソルの作成
                 batch_sources = []
                 for start in current_starts:
                     part = mix[:, start : start + C]
                     length = part.shape[-1]
-                    # 短い場合はパディング
                     if length < C:
                         part = F.pad(input=part, pad=(0, C - length, 0, 0), mode='constant', value=0)
                     batch_sources.append(part)
                 
-                # (Batch, Channels, ChunkSize)
                 batch_input = torch.stack(batch_sources)
 
-                # 時間計測（最初のバッチのみ）
                 if first_chunk and i == 0:
                     chunk_start_time = time.time()
 
-                # 推論実行 (Batch processing)
-                # 出力: (Batch, Stems, Channels, ChunkSize) 
-                # ※ModelがStem次元を返すか、(B, C, T)かによって調整が必要ですが、
-                # MelBandRoformerは通常 (B, Stems, C, T) または (B, C, T) [if 1 stem] を返します
                 output = model(batch_input)
                 
-                # 1ステム(Vocalのみ等)の場合は次元を合わせる
                 if output.ndim == 3: 
                      output = output.unsqueeze(1)
 
-                # 結果をOverlap-Add
                 for j, start in enumerate(current_starts):
-                    part_out = output[j] # (Stems, Channels, ChunkSize)
+                    part_out = output[j] 
                     length = min(C, total_length - start)
-                    
-                    # 加算
                     result[..., start : start + length] += part_out[..., :length]
                     counter[..., start : start + length] += 1.
 
-                # 時間予測と表示
-                if first_chunk and i == 0: # 最初のバッチ完了時
+                if first_chunk and i == 0: 
                     batch_time = time.time() - chunk_start_time
-                    # 1チャンクあたりの平均時間
                     avg_chunk_time = batch_time / len(current_starts)
                     first_chunk_time = avg_chunk_time
                     
@@ -492,17 +461,13 @@ def demix_track(config, model, mix, device, batch_size=4, first_chunk_time=None)
 
 
 # ==========================================
-# 3. Main Execution (Optimized)
+# 3. Main Execution (Batched & Parameterized)
 # ==========================================
 
 def run_folder(model, args, config, device, verbose=False):
-    # ★メモリに余裕があるならここを大きくする (例: 3600.0 = 1時間分一気読み)
-    # これによりディスクI/OとPythonループのオーバーヘッドを最小化
-    MAX_SEGMENT_SEC = 3600.0 
-    
-    # ★メモリ3倍OKならバッチサイズを4〜8に設定
-    # VRAM 24GBなら batch_size=4, 4090/A100なら batch_size=8 いける可能性があります
-    BATCH_SIZE = 4
+    # コマンドライン引数からパラメータ取得
+    MAX_SEGMENT_SEC = args.max_segment_sec
+    BATCH_SIZE = args.batch_size
 
     model.eval()
     all_mixtures_path = glob.glob(args.input_folder + '/*.ogg')
@@ -528,7 +493,6 @@ def run_folder(model, args, config, device, verbose=False):
                 total_frames = len(f_in)
                 segment_frames = int(MAX_SEGMENT_SEC * sr)
 
-                # GPUリサンプラー
                 if sr != 16000:
                     resampler = torchaudio.transforms.Resample(
                         orig_freq=sr, new_freq=16000, dtype=torch.float32
@@ -553,7 +517,6 @@ def run_folder(model, args, config, device, verbose=False):
 
                     mixture = torch.tensor(mix.T, dtype=torch.float32, device=device)
 
-                    # バッチサイズを指定して実行
                     res_chunk, first_chunk_time = demix_track(
                         config, model, mixture, device, 
                         batch_size=BATCH_SIZE, 
@@ -590,7 +553,10 @@ def proc_folder(args):
     parser.add_argument("--input_folder", type=str, help="folder with songs to process")
     parser.add_argument("--store_dir", default="", type=str, help="path to store model outputs")
     parser.add_argument("--device_ids", nargs='+', type=int, default=0, help='list of gpu ids')
-    parser.add_argument("--batch_size", type=int, default=4, help='batch size for inference (increase for speed, costs VRAM)')
+    
+    # 高速化パラメータ
+    parser.add_argument("--batch_size", type=int, default=1, help='batch size for inference (default: 1)')
+    parser.add_argument("--max_segment_sec", type=float, default=1200.0, help='max segment length in seconds to process in memory (default: 1200.0)')
     
     if args is None:
         args = parser.parse_args()
@@ -621,9 +587,6 @@ def proc_folder(args):
         torch.load(args.model_path, map_location=device)
     )
     
-    # Run with batch size
-    # グローバル変数を直接書き換える形になりますが、関数内でBATCH_SIZEを使用します。
-    # 正式には引数で渡すのが綺麗ですが、既存構造を維持するため関数内変数を調整済み。
     run_folder(model, args, config, device, verbose=False)
 
 
